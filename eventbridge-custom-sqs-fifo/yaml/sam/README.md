@@ -66,37 +66,45 @@ Important: this application uses various AWS services and there are costs associ
 
 ## Testing
 
-These steps use the AWS CLI (`aws eventsv2`, v2.37.5+). Replace `STACK_NAME` and the Region as needed.
+These steps use the AWS CLI (`aws eventsv2`, v2.37.5+) in a bash or zsh terminal. Run every step in the same terminal session, because the steps share the variables set in step 1. The commands use your default AWS Region; if the stack is in another Region, set `AWS_REGION` first.
 
-1. Capture the stack outputs:
+1. Set the stack name you chose during `sam deploy --guided`, and load the stack outputs into variables:
 
     ```
-    BUS_ARN=$(aws cloudformation describe-stacks --stack-name STACK_NAME \
-      --query "Stacks[0].Outputs[?OutputKey=='EventBusArn'].OutputValue" --output text)
+    export STACK_NAME=eventbridge-custom-sqs-fifo
 
-    QUEUE_URL=$(aws cloudformation describe-stacks --stack-name STACK_NAME \
-      --query "Stacks[0].Outputs[?OutputKey=='TargetQueueUrl'].OutputValue" --output text)
+    out() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+      --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+
+    BUS_ARN=$(out EventBusArn)
+    SUB_ARN=$(out SubscriberArn)
+    QUEUE_URL=$(out TargetQueueUrl)
+    QUEUE_ARN=$(out TargetQueueArn)
+    DLQ_URL=$(out DeliveryDLQUrl)
+    ROLE_ARN=$(out DeliveryRoleArn)
+    LOG_GROUP=$(out SubscriberLogGroup)
+    echo "$BUS_ARN"
     ```
 
-2. Publish two ordered events in the same event group. `EventBusArn` is a top-level field; ordering within a group is set by each entry's `SystemMetadata.EventGroupId`, and `DeduplicationId` lets the bus suppress a repeated publish. Save this as `putevents.json`:
+    The last line prints the bus ARN; if it is empty, check the stack name and Region.
 
-    ```json
+2. Publish two ordered events in the same event group. `EventBusArn` is a top-level field; ordering within a group is set by each entry's `SystemMetadata.EventGroupId`, and `DeduplicationId` lets the bus suppress a repeated publish. This block writes `putevents.json` from the variables and publishes it. The `DeduplicationId` values include the current time, so running the block again publishes new events instead of being suppressed:
+
+    ```
+    NOW=$(date +%s)
+    cat > putevents.json <<EOF
     {
-      "EventBusArn": "REPLACE_WITH_EventBusArn_OUTPUT",
+      "EventBusArn": "$BUS_ARN",
       "Entries": [
         { "Source": "com.example.orders", "DetailType": "OrderPlaced",
           "Detail": "{\"orderId\":\"1001\",\"seq\":1}",
-          "SystemMetadata": { "EventGroupId": "customer-42", "DeduplicationId": "evt-1" } },
+          "SystemMetadata": { "EventGroupId": "customer-42", "DeduplicationId": "evt-1-$NOW" } },
         { "Source": "com.example.orders", "DetailType": "OrderPlaced",
           "Detail": "{\"orderId\":\"1001\",\"seq\":2}",
-          "SystemMetadata": { "EventGroupId": "customer-42", "DeduplicationId": "evt-2" } }
+          "SystemMetadata": { "EventGroupId": "customer-42", "DeduplicationId": "evt-2-$NOW" } }
       ]
     }
-    ```
-
-    Then publish:
-
-    ```
+    EOF
     aws eventsv2 put-events --cli-input-json file://putevents.json
     ```
 
@@ -115,10 +123,9 @@ These steps use the AWS CLI (`aws eventsv2`, v2.37.5+). Replace `STACK_NAME` and
 4. Confirm the subscriber delivery logs landed. Records can take a minute or two to appear:
 
     ```
-    LG=/aws/vendedlogs/STACK_NAME-subscriber
-    STREAM=$(aws logs describe-log-streams --log-group-name "$LG" \
+    STREAM=$(aws logs describe-log-streams --log-group-name "$LOG_GROUP" \
       --query 'logStreams[0].logStreamName' --output text)
-    aws logs get-log-events --log-group-name "$LG" --log-stream-name "$STREAM" \
+    aws logs get-log-events --log-group-name "$LOG_GROUP" --log-stream-name "$STREAM" \
       --start-from-head --query 'events[].message'
     ```
 
@@ -134,31 +141,22 @@ The dead-letter queue stays empty while deliveries succeed, so `receive-message`
     sam deploy --parameter-overrides MaxRetryAttempts=0 MaxEventAgeInSeconds=60
     ```
 
-2. Deny the delivery role `sqs:SendMessage` on the target queue with a queue policy. Save this as `deny.json`, replacing the placeholders with the `DeliveryRoleArn` and `TargetQueueArn` outputs (the policy is a JSON string, so its inner quotes stay escaped):
+2. Deny the delivery role `sqs:SendMessage` on the target queue with a queue policy. This block writes `deny.json` from the variables and applies it (the policy is a JSON string, so its inner quotes stay escaped):
 
-    ```json
+    ```
+    cat > deny.json <<EOF
     {
-      "Policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"REPLACE_WITH_DeliveryRoleArn_OUTPUT\"},\"Action\":\"sqs:SendMessage\",\"Resource\":\"REPLACE_WITH_TargetQueueArn_OUTPUT\"}]}"
+      "Policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"$ROLE_ARN\"},\"Action\":\"sqs:SendMessage\",\"Resource\":\"$QUEUE_ARN\"}]}"
     }
-    ```
-
-    Then apply it:
-
-    ```
+    EOF
     aws sqs set-queue-attributes --queue-url "$QUEUE_URL" --attributes file://deny.json
     ```
 
-3. Publish the two events in `putevents.json` again. Change their `DeduplicationId` values first, so the bus does not suppress the repeat:
-
-    ```
-    aws eventsv2 put-events --cli-input-json file://putevents.json
-    ```
+3. Run the block from [Testing](#testing) step 2 again. It publishes two new events in `customer-42`, which now fail delivery.
 
 4. Read the dead-letter queue. `--wait-time-seconds` long-polls, so the call waits for the record instead of returning empty:
 
     ```
-    DLQ_URL=$(aws cloudformation describe-stacks --stack-name STACK_NAME \
-      --query "Stacks[0].Outputs[?OutputKey=='DeliveryDLQUrl'].OutputValue" --output text)
     aws sqs receive-message --queue-url "$DLQ_URL" --max-number-of-messages 10 \
       --wait-time-seconds 20 --visibility-timeout 0 \
       --attribute-names All --message-attribute-names All
@@ -180,63 +178,60 @@ A dead-letter record lists the failed events' ids and timestamps; it does not co
 1. Read the failure records. Note each `failedMessages[].eventId`, the earliest and latest `timestamp`, and the `errorCode`. If no delivery has failed, the queue is empty and this returns nothing; to produce a record, follow [Testing the dead-letter queue](#testing-the-dead-letter-queue).
 
     ```
-    DLQ_URL=$(aws cloudformation describe-stacks --stack-name STACK_NAME \
-      --query "Stacks[0].Outputs[?OutputKey=='DeliveryDLQUrl'].OutputValue" --output text)
     aws sqs receive-message --queue-url "$DLQ_URL" --max-number-of-messages 10 \
       --wait-time-seconds 20 --visibility-timeout 0 --query 'Messages[].Body'
     ```
 
 2. Fix the cause that `errorCode` names, for example the delivery role's permissions or the target queue.
 
-3. Collect the values the replay subscriber needs:
+3. Set the failed event ids and a time window that covers the records' timestamps, using the values from step 1. The `aws:EventId` filter makes the replay exact, so the window can start a minute or two before the earliest timestamp. `END` must not be in the future, or `create-subscriber` fails with `EndPoint must not be in the future`; if the records are only a few seconds old, wait a minute and set `END` to the current minute. For more or fewer events, add or remove ids in the `Pattern` line of the block below:
 
     ```
-    SUB_ARN=$(aws cloudformation describe-stacks --stack-name STACK_NAME \
-      --query "Stacks[0].Outputs[?OutputKey=='SubscriberArn'].OutputValue" --output text)
-    ROLE_ARN=$(aws eventsv2 describe-subscriber --subscriber-arn "$SUB_ARN" \
-      --query InvokeConfiguration.RoleArn --output text)
+    EVENT_ID_1=FIRST_FAILED_EVENT_ID
+    EVENT_ID_2=SECOND_FAILED_EVENT_ID
+    START=2026-11-05T12:04:00Z
+    END=2026-11-05T12:06:00Z
     ```
 
-4. Save this as `redrive.json`. Replace the placeholders with your bus ARN, target queue ARN and role ARN, the failed event ids, and a time window that covers the records' timestamps. The `aws:EventId` filter makes the replay exact, so the window can be slightly wider:
+4. Write `redrive.json` from the variables and create the temporary replay subscriber. It reuses the stack's target queue and delivery role. The `\$events` escapes keep the shell from expanding the JSONata expressions:
 
-    ```json
+    ```
+    cat > redrive.json <<EOF
     {
-      "Name": "redrive-YYYY-MM-DD",
-      "EventBusArn": "REPLACE_WITH_EventBusArn_OUTPUT",
+      "Name": "redrive-$(date +%Y%m%d%H%M%S)",
+      "EventBusArn": "$BUS_ARN",
       "Type": "FIFO",
       "StartingPosition": "POINT_IN_TIME",
       "PointInTimeConfiguration": {
         "PointType": "TIMESTAMP",
-        "StartingPoint": "2026-09-30T12:29:00Z",
-        "EndPoint": "2026-09-30T12:32:00Z"
+        "StartingPoint": "$START",
+        "EndPoint": "$END"
       },
       "FilterConfiguration": {
         "Filters": [ { "Scope": "SYSTEM_METADATA",
-                       "Pattern": "{\"aws:EventId\":[\"FAILED_EVENT_ID_1\",\"FAILED_EVENT_ID_2\"]}" } ]
+                       "Pattern": "{\"aws:EventId\":[\"$EVENT_ID_1\",\"$EVENT_ID_2\"]}" } ]
       },
       "InvokeConfiguration": {
-        "TargetArn": "REPLACE_WITH_TargetQueueArn_OUTPUT",
-        "RoleArn": "REPLACE_WITH_ROLE_ARN",
+        "TargetArn": "$QUEUE_ARN",
+        "RoleArn": "$ROLE_ARN",
         "SqsParameters": {
-          "MessageGroupId": "{% $events.SystemMetadata.EventGroupId %}",
-          "MessageDeduplicationId": "{% $events.SystemMetadata.\"aws:EventId\" %}"
+          "MessageGroupId": "{% \$events.SystemMetadata.EventGroupId %}",
+          "MessageDeduplicationId": "{% \$events.SystemMetadata.\"aws:EventId\" %}"
         }
       }
     }
+    EOF
+    REDRIVE_ARN=$(aws eventsv2 create-subscriber --cli-input-json file://redrive.json \
+      --query SubscriberArn --output text)
+    echo "$REDRIVE_ARN"
     ```
 
-    Then create the subscriber:
-
-    ```
-    aws eventsv2 create-subscriber --cli-input-json file://redrive.json
-    ```
-
-    The replayed events keep their `EventGroupId`, so they return to their original groups in order, and they keep their `aws:EventId`, so the queue still deduplicates them.
+    The replayed events keep their `EventGroupId`, so they return to their original groups in order, and they keep their `aws:EventId`, so the queue still deduplicates them. Read the target queue with the command in [Testing](#testing) step 3 to see them arrive.
 
 5. When the events have arrived in the target queue, delete the temporary subscriber:
 
     ```
-    aws eventsv2 delete-subscriber --subscriber-arn REDRIVE_SUBSCRIBER_ARN
+    aws eventsv2 delete-subscriber --subscriber-arn "$REDRIVE_ARN"
     ```
 
     The dead-letter records you handled stay in the queue until its 14-day retention expires, or until you delete the stack. If you recover events again within that time, leave out the event ids you have already replayed, so they are not delivered twice.
@@ -252,7 +247,7 @@ A dead-letter record lists the failed events' ids and timestamps; it does not co
 2. Confirm the stack has been deleted:
 
     ```
-    aws cloudformation list-stacks --query "StackSummaries[?contains(StackName,'STACK_NAME')].StackStatus"
+    aws cloudformation list-stacks --query "StackSummaries[?contains(StackName,'$STACK_NAME')].StackStatus"
     ```
 
 ----
